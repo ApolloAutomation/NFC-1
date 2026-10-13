@@ -3,19 +3,15 @@ name: CI
 on:
   pull_request:
 
+permissions:
+  contents: read
+
+# Label check lives in label-check.yml on pull_request_target so it can
+# label fork-submitted PRs; plain pull_request tokens are read-only there.
 jobs:
   ci:
-    name: Building ${{ matrix.file }}
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        file: # TODO: Rename
-          - Integrations/ESPHome/PLT-1.yaml
-          - Integrations/ESPHome/PLT-1_BLE.yaml
-    steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4.1.7
-      - name: Build ESPHome firmware to verify configuration
-        uses: esphome/build-action@v3.1.0
-        with:
-          yaml_file: ${{ matrix.file }}
+    name: CI
+    uses: ApolloAutomation/Workflows/.github/workflows/esphome-ci.yml@main
+    with:
+      yaml-files: |
+        Integrations/ESPHome/NFC-1.yaml

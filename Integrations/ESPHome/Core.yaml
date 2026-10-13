@@ -1,26 +1,1137 @@
 substitutions:
-  name: apollo-plt-1 # TODO: Rename
-  version: "24.8.7.2"
-  device_description: ${name} made by Apollo Automation - version ${version}.
+  version: "26.10.13.2"
 
 esp32:
-  board: esp32-c3-devkitm-1
+  board: esp32-c6-devkitm-1
+  variant: esp32c6
+  flash_size: 8MB
+  # Native esp-idf toolchain ignores platformio_options.board_build.flash_mode
+  flash_mode: dio
   framework:
     type: esp-idf
 
-api:
+# Passive piezo on LEDC PWM; max_power caps the duty cycle like H-3
+output:
+  - platform: ledc
+    pin: GPIO6
+    id: buzzer
+    max_power: 50%
+
+rtttl:
+  id: rtttl_buzzer
+  output: buzzer
 
 globals:
-  - id: cycleCounter
+  # First boot, not yet acknowledged by a tag read
+  - id: runTest
+    restore_value: yes
+    type: bool
+    initial_value: "true"
+  # 0 = read/idle, 1 = write, 2 = clean, 3 = format
+  - id: nfc_task_kind
     type: int
     restore_value: no
     initial_value: '0'
-  - id: button_press_timestamp
+  # Task that last completed; labels the verification result after nfc_task_kind reset
+  - id: nfc_task_kind_done
+    type: int
     restore_value: no
-    type: uint32_t
     initial_value: '0'
+  # Payload the verification re-read must contain
+  - id: nfc_expected
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: nfc_write_finished
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # How to treat the next on_tag: 0 normal, 1 verify write, 2 verify clean/format, 3 quiet
+  - id: nfc_post_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: nfc_post_until
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Snapshot of the decision for the current on_tag (-1 = ignore)
+  - id: nfc_scan_action
+    type: int
+    restore_value: no
+    initial_value: '0'
+  # Sanitized HA tag id (or UID) reported to HA for the current scan
+  - id: nfc_report_id
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  # Sanitized first-record payload published to Last Tag Content
+  - id: nfc_report_content
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  # True when the current scan is a random 08- UID with no NDEF
+  - id: nfc_random_uid
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: nfc_emu_last_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Watchdog: millis() of the last NFC activity
+  - id: nfc_last_activity
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Watchdog: a fast restart is pending
+  - id: nfc_wd_armed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Watchdog: millis() of the last discovery restart
+  - id: nfc_wd_last_restart
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: mode_select_guard
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
-captive_portal:
+i2c:
+  sda: GPIO0
+  scl: GPIO1
+  id: bus_a
+  scan: true
+  frequency: 400kHz
 
-web_server:
-  port: 80
+pn7160_i2c:
+  id: nfcc
+  i2c_id: bus_a
+  address: 0x28
+  dwl_req_pin: GPIO21
+  irq_pin: GPIO22
+  ven_pin: GPIO23
+  # 250ms default is shorter than the 760ms RW+CE discovery cycle
+  tag_ttl: 1000ms
+  on_tag:
+    then:
+      - lambda: |-
+          id(nfc_last_activity) = millis();
+          id(nfc_wd_armed) = true;
+          // Phones in HCE mode can show up as a random-UID (08-xx-xx-xx) NFC-A target
+          bool random_uid = !tag.has_ndef_message() && x.size() == 11 && x.rfind("08-", 0) == 0;
+          id(nfc_random_uid) = random_uid;
+          bool junk = id(card_emulation).state && random_uid;
+          int action = -1;
+          if (!junk) {
+            bool in_window = id(nfc_post_mode) != 0;
+            action = in_window ? id(nfc_post_mode) : 0;
+            id(nfc_post_mode) = 0;
+            id(nfc_post_until) = 0;
+          }
+          id(nfc_scan_action) = action;
+          // Sanitize to valid UTF-8 (max 250 chars, keep \n and \t, invalid bytes -> '?')
+          auto sanitize = [](const std::string &raw) {
+            std::string safe;
+            for (size_t i = 0; i < raw.size() && safe.size() < 250;) {
+              uint8_t c = raw[i];
+              size_t n = c < 0x80 ? 1 : (c >= 0xC2 && c <= 0xDF) ? 2 : (c >= 0xE0 && c <= 0xEF) ? 3 : (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+              bool ok = n != 0 && i + n <= raw.size();
+              if (ok && n > 1) {
+                uint8_t c1 = raw[i + 1];
+                uint8_t lo = c == 0xE0 ? 0xA0 : (c == 0xF0 ? 0x90 : 0x80);
+                uint8_t hi = c == 0xED ? 0x9F : (c == 0xF4 ? 0x8F : 0xBF);
+                ok = c1 >= lo && c1 <= hi;
+                for (size_t k = 2; ok && k < n; k++) ok = ((uint8_t) raw[i + k] & 0xC0) == 0x80;
+              }
+              if (ok && n == 1 && (c < 0x20 || c == 0x7F) && c != '\n' && c != '\t') ok = false;
+              if (ok) { safe.append(raw, i, n); i += n; } else { safe += '?'; i++; }
+            }
+            return safe;
+          };
+          std::string ha_id = nfc::get_ha_tag_ndef(tag);
+          std::string content;
+          if (tag.has_ndef_message()) {
+            const auto &records = tag.get_ndef_message()->get_records();
+            if (!records.empty()) content = records[0]->get_payload();
+          }
+          id(nfc_report_content) = sanitize(content);
+          ha_id = sanitize(ha_id);
+          id(nfc_report_id) = ha_id.empty() ? x : ha_id;
+      - if:
+          condition:
+            lambda: 'return id(nfc_scan_action) >= 0;'
+          then:
+            - script.execute: dismiss_first_boot
+            - lambda: |-
+                id(last_tag_uid).publish_state(x);
+                id(last_tag_type).publish_state(tag.get_tag_type());
+                id(last_tag_content).publish_state(id(nfc_report_content));
+                id(last_tag).publish_state(id(nfc_report_id));
+            - binary_sensor.template.publish:
+                id: tag_present
+                state: true
+      # Normal scan
+      - if:
+          condition:
+            lambda: 'return id(nfc_scan_action) == 0;'
+          then:
+            - event.trigger:
+                id: nfc_event
+                event_type: tag_scanned
+            - script.execute:
+                id: led_flash
+                r: 0
+                g: 255
+                b: 0
+                count: 1
+                on_ms: 400
+                off_ms: 50
+            - script.execute:
+                id: buzzer_play
+                song: "scan:d=16,o=6,b=200:c"
+            # Random phone UIDs are not real tags; never register them in HA
+            - if:
+                condition:
+                  lambda: 'return !id(nfc_random_uid);'
+                then:
+                  - homeassistant.tag_scanned: !lambda 'return id(nfc_report_id);'
+      # Verification read of the tag we just wrote
+      - if:
+          condition:
+            lambda: 'return id(nfc_scan_action) == 1;'
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    if (!tag.has_ndef_message()) return false;
+                    for (const auto &rec : tag.get_ndef_message()->get_records()) {
+                      if (rec->get_payload() == id(nfc_expected)) return true;
+                    }
+                    return false;
+                then:
+                  - text_sensor.template.publish:
+                      id: nfc_last_result
+                      state: "Write verified"
+                  - event.trigger:
+                      id: nfc_event
+                      event_type: write_verified
+                else:
+                  - text_sensor.template.publish:
+                      id: nfc_last_result
+                      state: "Write mismatch"
+                  - event.trigger:
+                      id: nfc_event
+                      event_type: write_mismatch
+                  - script.execute: feedback_fail
+            # Register a freshly written HA tag right away
+            - if:
+                condition:
+                  lambda: 'return !id(nfc_random_uid);'
+                then:
+                  - homeassistant.tag_scanned: !lambda 'return id(nfc_report_id);'
+      # Verification read after clean / format: pass when no payload remains
+      - if:
+          condition:
+            lambda: 'return id(nfc_scan_action) == 2;'
+          then:
+            - if:
+                condition:
+                  lambda: |-
+                    if (!tag.has_ndef_message())
+                      return !(id(nfc_task_kind_done) == 3 && tag.get_tag_type() == nfc::MIFARE_CLASSIC);
+                    for (const auto &rec : tag.get_ndef_message()->get_records()) {
+                      if (!rec->get_payload().empty()) return false;
+                    }
+                    return true;
+                then:
+                  - text_sensor.template.publish:
+                      id: nfc_last_result
+                      state: !lambda 'return id(nfc_task_kind_done) == 2 ? std::string("Clean done (no readable data)") : std::string("Format done (no readable data)");'
+                  - event.trigger:
+                      id: nfc_event
+                      event_type: !lambda 'return id(nfc_task_kind_done) == 2 ? std::string("clean_verified") : std::string("format_verified");'
+                else:
+                  - text_sensor.template.publish:
+                      id: nfc_last_result
+                      state: !lambda 'return id(nfc_task_kind_done) == 2 ? std::string("Clean failed (data remains)") : std::string("Format failed (data remains)");'
+                  - event.trigger:
+                      id: nfc_event
+                      event_type: !lambda 'return id(nfc_task_kind_done) == 2 ? std::string("clean_failed") : std::string("format_failed");'
+                  - script.execute: feedback_fail
+                  # Data survived, so treat it as a normal tag for HA
+                  - if:
+                      condition:
+                        lambda: 'return !id(nfc_random_uid);'
+                      then:
+                        - homeassistant.tag_scanned: !lambda 'return id(nfc_report_id);'
+      # Quiet read after a failed write: sensors updated, no feedback
+      - if:
+          condition:
+            lambda: 'return id(nfc_scan_action) == 3 && tag.has_ndef_message();'
+          then:
+            - if:
+                condition:
+                  lambda: 'return !id(nfc_random_uid);'
+                then:
+                  - homeassistant.tag_scanned: !lambda 'return id(nfc_report_id);'
+  on_tag_removed:
+    then:
+      - lambda: |-
+          id(nfc_last_activity) = millis();
+          id(nfc_wd_armed) = true;
+      # A tag consumed by a write/clean/format never reported present
+      - if:
+          condition:
+            and:
+              - binary_sensor.is_on: tag_present
+              # A swapped-in different tag must not clear Tag Present
+              - lambda: 'return x == id(last_tag_uid).state;'
+          then:
+            - binary_sensor.template.publish:
+                id: tag_present
+                state: false
+            - event.trigger:
+                id: nfc_event
+                event_type: tag_removed
+  on_finished_write:
+    then:
+      # Fires when formatting succeeded and a write was attempted; the write
+      # result itself is only logged, so the re-read verifies it
+      - lambda: 'id(nfc_write_finished) = true;'
+  on_emulated_tag_scan:
+    then:
+      - lambda: |-
+          id(nfc_last_activity) = millis();
+          id(nfc_wd_armed) = true;
+      # A phone may read the emulated NDEF file several times per tap
+      - if:
+          condition:
+            lambda: 'return (millis() - id(nfc_emu_last_ms)) > 1500;'
+          then:
+            - lambda: 'id(nfc_emu_last_ms) = millis();'
+            - script.execute: dismiss_first_boot
+            - event.trigger:
+                id: nfc_event
+                event_type: emulated_tag_scanned
+            - script.execute:
+                id: led_flash
+                r: 0
+                g: 200
+                b: 255
+                count: 1
+                on_ms: 400
+                off_ms: 50
+            - script.execute:
+                id: buzzer_play
+                song: "emu:d=16,o=6,b=200:g,g"
+
+switch:
+  - platform: factory_reset
+    id: factory_reset_switch
+    internal: true
+
+  - platform: template
+    name: "Buzzer"
+    id: buzzer_enabled
+    icon: mdi:volume-high
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "LED Feedback"
+    id: led_feedback_enabled
+    icon: mdi:led-on
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    # State trigger: publish_state has already set state, so led_idle sees the switch on
+    on_turn_on:
+      # Re-show the pulse only when a task is actually armed
+      - if:
+          condition:
+            lambda: 'return id(nfc_task_kind) != 0;'
+          then:
+            - script.execute: led_idle
+    turn_off_action:
+      # Stop an armed-mode pulse that would otherwise outlive the switch
+      - light.turn_off: rgb_light
+
+  # Adds the HA companion Android App Record to HA tag URIs only
+  - platform: template
+    name: "HA App Record"
+    id: ha_app_record
+    icon: mdi:android
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    # Re-apply so a running emulation picks up the AAR change
+    on_turn_on:
+      - if:
+          condition:
+            switch.is_on: card_emulation
+          then:
+            - script.execute: apply_emulation
+    on_turn_off:
+      - if:
+          condition:
+            switch.is_on: card_emulation
+          then:
+            - script.execute: apply_emulation
+
+  # Not optimistic: reflects the chip's real state (off when the URL is empty)
+  - platform: template
+    name: "Card Emulation"
+    id: card_emulation
+    icon: mdi:cellphone-nfc
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: 'return id(nfcc).tag_emulation_enabled();'
+    turn_on_action:
+      - script.execute: apply_emulation
+    turn_off_action:
+      - tag.emulation_off: nfcc
+      - lambda: 'id(nfcc).set_tag_ttl(1000);'
+
+  - platform: template
+    name: "Tag Polling"
+    id: tag_polling
+    icon: mdi:nfc-search-variant
+    entity_category: config
+    disabled_by_default: true
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: 'return id(nfcc).polling_enabled();'
+    turn_on_action:
+      - tag.polling_on: nfcc
+    turn_off_action:
+      - tag.polling_off: nfcc
+
+button:
+  - platform: factory_reset
+    id: factory_reset_button
+    name: "Factory Reset"
+    entity_category: diagnostic
+    # Exposed but off by default; avoids accidents
+    disabled_by_default: true
+
+  - platform: template
+    name: "Write URL Tag"
+    id: write_tag_button
+    icon: mdi:tag-arrow-down
+    on_press:
+      - script.execute:
+          id: nfc_write
+          payload: !lambda 'return id(write_url).state;'
+          is_text: false
+
+  - platform: template
+    name: "Write New HA Tag"
+    id: write_ha_tag_button
+    icon: mdi:home-assistant
+    on_press:
+      - script.execute:
+          id: nfc_write
+          payload: !lambda 'return nfc::get_random_ha_tag_ndef();'
+          is_text: false
+
+  - platform: template
+    name: "Clean Tag"
+    id: clean_tag_button
+    icon: mdi:eraser
+    on_press:
+      - script.execute:
+          id: nfc_task
+          task: 2
+
+  # On NTAG / Ultralight, format is the same as clean (pn7160.cpp:522-529)
+  - platform: template
+    name: "Format Tag"
+    id: format_tag_button
+    icon: mdi:tag-remove
+    on_press:
+      - script.execute:
+          id: nfc_task
+          task: 3
+
+  - platform: template
+    name: "Cancel Tag Operation"
+    id: cancel_button
+    icon: mdi:cancel
+    on_press:
+      - script.execute: nfc_cancel
+
+number:
+  - platform: template
+    name: Volume
+    id: volume_control
+    min_value: 0
+    max_value: 100
+    initial_value: 50
+    unit_of_measurement: "%"
+    step: 1
+    icon: "mdi:volume-high"
+    entity_category: "config"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(rtttl_buzzer).set_gain(pow(x / 100.0f, 3));
+
+  - platform: template
+    name: "Feedback Brightness"
+    id: led_brightness
+    icon: mdi:brightness-6
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 100
+    step: 1
+    initial_value: 80
+    unit_of_measurement: "%"
+
+  - platform: template
+    name: "Mode Timeout"
+    id: mode_timeout
+    icon: mdi:timer-sand
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 300
+    step: 5
+    initial_value: 30
+    unit_of_measurement: "s"
+    mode: box
+
+select:
+  - platform: template
+    name: "Mode"
+    id: nfc_mode
+    icon: mdi:nfc-variant
+    optimistic: true
+    options:
+      - Read
+      - Write
+      - Clean
+      - Format
+    initial_option: Read
+    restore_value: false
+    on_value:
+      # Internal publishes go through set_mode_display, which sets the guard
+      - if:
+          condition:
+            lambda: 'return !id(mode_select_guard);'
+          then:
+            - if:
+                condition:
+                  lambda: 'return x == "Read";'
+                then:
+                  - script.execute: nfc_cancel
+            - if:
+                condition:
+                  lambda: 'return x == "Write";'
+                then:
+                  - script.execute:
+                      id: nfc_write
+                      payload: !lambda 'return id(write_url).state;'
+                      is_text: false
+            - if:
+                condition:
+                  lambda: 'return x == "Clean";'
+                then:
+                  - script.execute:
+                      id: nfc_task
+                      task: 2
+            - if:
+                condition:
+                  lambda: 'return x == "Format";'
+                then:
+                  - script.execute:
+                      id: nfc_task
+                      task: 3
+
+text:
+  # 120 chars keeps a URI record inside NTAG213's 144 B user memory
+  - platform: template
+    name: "Write URL"
+    id: write_url
+    icon: mdi:link-variant
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    max_length: 120
+    initial_value: ""
+
+  - platform: template
+    name: "Emulation URL"
+    id: emulation_url
+    icon: mdi:cellphone-link
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    max_length: 120
+    initial_value: ""
+    on_value:
+      - if:
+          condition:
+            switch.is_on: card_emulation
+          then:
+            - script.execute: apply_emulation
+
+binary_sensor:
+  - platform: template
+    name: "Tag Present"
+    id: tag_present
+    icon: mdi:nfc
+
+  # Only false after >10 consecutive NCI init failures (pn7160.cpp:722-737)
+  - platform: template
+    name: "NFC Reader"
+    id: nfc_reader_ok
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: 'return !id(nfcc).is_failed();'
+
+event:
+  - platform: template
+    name: "NFC Event"
+    id: nfc_event
+    icon: mdi:nfc-variant
+    event_types:
+      - tag_scanned
+      - tag_removed
+      - emulated_tag_scanned
+      - armed
+      - written
+      - write_failed
+      - write_verified
+      - write_mismatch
+      - cleaned
+      - clean_verified
+      - clean_failed
+      - formatted
+      - format_verified
+      - format_failed
+      - unverified
+      - timed_out
+      - cancelled
+
+text_sensor:
+  # HA tag id when the tag carries one, otherwise the UID
+  - platform: template
+    name: "Last Tag"
+    id: last_tag
+    icon: mdi:tag
+    update_interval: never
+
+  - platform: template
+    name: "Last Tag UID"
+    id: last_tag_uid
+    icon: mdi:identifier
+    update_interval: never
+
+  - platform: template
+    name: "Last Tag Content"
+    id: last_tag_content
+    icon: mdi:text
+    update_interval: never
+
+  - platform: template
+    name: "Last Tag Type"
+    id: last_tag_type
+    icon: mdi:tag-outline
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
+
+  - platform: template
+    name: "Last Operation"
+    id: nfc_last_result
+    icon: mdi:information-outline
+    update_interval: never
+
+sensor:
+  - platform: internal_temperature
+    name: "ESP Temperature"
+    id: sys_esp_temperature
+
+  - platform: uptime
+    name: Uptime
+    id: sys_uptime
+    update_interval: 60s
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: rgb_light
+    name: "RGB Light"
+    pin:
+      number: GPIO5
+      ignore_strapping_warning: true
+    default_transition_length: 0s
+    chipset: WS2812
+    num_leds: 1
+    channel_colors: GRB
+    rmt_symbols: 48
+    color_correct: [40%, 40%, 40%]
+    effects:
+      - pulse:
+          name: "Slow Pulse"
+          transition_length: 250ms
+          update_interval: 250ms
+          min_brightness: 50%
+          max_brightness: 100%
+      - pulse:
+          name: "Fast Pulse"
+          transition_length: 100ms
+          update_interval: 100ms
+          min_brightness: 50%
+          max_brightness: 100%
+      # Pulses the current colour; master brightness still applies, unlike 'pulse'
+      - addressable_lambda:
+          name: "Armed Pulse"
+          update_interval: 40ms
+          lambda: |-
+            uint32_t t = millis() % 2000;
+            float s = t < 1000 ? t / 1000.0f : (2000 - t) / 1000.0f;
+            it[0] = current_color * (uint8_t) (255 * (0.15f + 0.85f * s));
+
+# The pn71xx driver has no liveness check while polling, so a silent PN7160
+# can stop reporting tags until reboot. Restarting discovery is cheap and
+# only toggles polling; it never rewrites NFCC configuration.
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              uint32_t now = millis();
+              if (!id(nfcc).polling_enabled()) return false;
+              if (id(nfcc).is_writing()) return false;
+              if (id(nfc_task_kind) != 0) return false;
+              if (id(tag_present).state) return false;
+              bool fast = id(nfc_wd_armed) && (now - id(nfc_last_activity) >= 5000);
+              bool slow = (now - id(nfc_last_activity) >= 300000) &&
+                          (now - id(nfc_wd_last_restart) >= 300000);
+              return fast || slow;
+          then:
+            - lambda: |-
+                uint32_t now = millis();
+                bool fast = id(nfc_wd_armed) && (now - id(nfc_last_activity) >= 5000);
+                id(nfc_wd_armed) = false;
+                id(nfc_wd_last_restart) = now;
+                ESP_LOGD("nfc_watchdog", "Restarting tag discovery (%s)", fast ? "after activity" : "periodic");
+            - tag.polling_off: nfcc
+            - tag.polling_on: nfcc
+
+script:
+  # ---------- NFC task runner: 1 = write, 2 = clean, 3 = format ----------
+  - id: nfc_task
+    mode: restart
+    parameters:
+      task: int
+    then:
+      - script.execute: dismiss_first_boot
+      - lambda: |-
+          id(nfc_task_kind) = task;
+          id(nfc_task_kind_done) = task;
+          id(nfc_write_finished) = false;
+          id(nfc_post_mode) = 0;
+          id(nfc_post_until) = 0;
+      - if:
+          condition:
+            lambda: 'return task == 1;'
+          then:
+            - tag.set_write_mode: nfcc
+      - if:
+          condition:
+            lambda: 'return task == 2;'
+          then:
+            - tag.set_clean_mode: nfcc
+      - if:
+          condition:
+            lambda: 'return task == 3;'
+          then:
+            - tag.set_format_mode: nfcc
+      - if:
+          condition:
+            pn7160.is_writing: {}
+          then:
+            - script.execute:
+                id: set_mode_display
+                option: !lambda 'return task == 1 ? std::string("Write") : (task == 2 ? std::string("Clean") : std::string("Format"));'
+            - text_sensor.template.publish:
+                id: nfc_last_result
+                state: "Waiting for tag"
+            - event.trigger:
+                id: nfc_event
+                event_type: armed
+            - script.execute:
+                id: buzzer_play
+                song: "arm:d=16,o=6,b=200:e,g"
+            - script.execute: led_idle
+            # The component reverts to read mode by itself once a tag was processed
+            - wait_until:
+                condition:
+                  not:
+                    pn7160.is_writing: {}
+                timeout: !lambda 'return (uint32_t) id(mode_timeout).state * 1000;'
+            - if:
+                condition:
+                  pn7160.is_writing: {}
+                then:
+                  # Timed out: nobody presented a tag
+                  - tag.set_read_mode: nfcc
+                  - lambda: 'id(nfc_task_kind) = 0;'
+                  - text_sensor.template.publish:
+                      id: nfc_last_result
+                      state: "Timed out"
+                  - event.trigger:
+                      id: nfc_event
+                      event_type: timed_out
+                  - script.execute:
+                      id: led_flash
+                      r: 255
+                      g: 120
+                      b: 0
+                      count: 2
+                      on_ms: 200
+                      off_ms: 200
+                  - script.execute:
+                      id: buzzer_play
+                      song: "timeout:d=8,o=5,b=180:c,p,c"
+                else:
+                  # Task ran (or a non-NFC-A target consumed it); the tag, if still
+                  # in the field, is re-read in read mode next and verifies the result
+                  - lambda: |-
+                      id(nfc_task_kind) = 0;
+                      if (task == 1) {
+                        id(nfc_post_mode) = id(nfc_write_finished) ? 1 : 3;
+                      } else {
+                        id(nfc_post_mode) = 2;
+                      }
+                      id(nfc_post_until) = millis() + 1500;
+                  - if:
+                      condition:
+                        lambda: 'return task == 1 && !id(nfc_write_finished);'
+                      then:
+                        - text_sensor.template.publish:
+                            id: nfc_last_result
+                            state: "Write failed (tag not formatted or unsupported)"
+                        - event.trigger:
+                            id: nfc_event
+                            event_type: write_failed
+                        - script.execute: feedback_fail
+                      else:
+                        - text_sensor.template.publish:
+                            id: nfc_last_result
+                            state: !lambda 'return task == 1 ? std::string("Write done, verifying") : (task == 2 ? std::string("Clean done, verifying") : std::string("Format done, verifying"));'
+                        - event.trigger:
+                            id: nfc_event
+                            event_type: !lambda 'return task == 1 ? std::string("written") : (task == 2 ? std::string("cleaned") : std::string("formatted"));'
+                        - script.execute:
+                            id: led_flash
+                            r: 0
+                            g: 255
+                            b: 0
+                            count: 2
+                            on_ms: 200
+                            off_ms: 150
+                        - script.execute:
+                            id: buzzer_play
+                            song: "ok:d=16,o=6,b=200:c,e,g"
+            - lambda: |-
+                id(nfc_last_activity) = millis();
+                id(nfc_wd_armed) = true;
+          else:
+            # write_mode() refuses when no message is set (pn7160.cpp:126-130)
+            - lambda: 'id(nfc_task_kind) = 0;'
+            - text_sensor.template.publish:
+                id: nfc_last_result
+                state: "Write refused: no message set"
+            - event.trigger:
+                id: nfc_event
+                event_type: write_failed
+            - script.execute: feedback_fail
+      - script.execute:
+          id: set_mode_display
+          option: "Read"
+      # led_flash ends with led_idle itself; calling it here would cut the flash short
+      - if:
+          condition:
+            not:
+              script.is_running: led_flash
+          then:
+            - script.execute: led_idle
+      # Verification window: report when the tag was lifted before the re-read
+      - if:
+          condition:
+            lambda: 'return id(nfc_post_mode) != 0;'
+          then:
+            - delay: 1500ms
+            - if:
+                condition:
+                  lambda: 'return id(nfc_post_mode) == 1 || id(nfc_post_mode) == 2;'
+                then:
+                  - lambda: |-
+                      id(nfc_post_mode) = 0;
+                      id(nfc_post_until) = 0;
+                  - text_sensor.template.publish:
+                      id: nfc_last_result
+                      state: !lambda 'return task == 1 ? std::string("Write unverified (tag removed)") : (task == 2 ? std::string("Clean unverified (tag removed)") : std::string("Format unverified (tag removed)"));'
+                  - event.trigger:
+                      id: nfc_event
+                      event_type: unverified
+            # post_mode 3 (quiet window) just expires silently
+            - lambda: |-
+                id(nfc_post_mode) = 0;
+                id(nfc_post_until) = 0;
+
+  # ---------- Write entry point: builds the message, then arms the write task ----------
+  - id: nfc_write
+    mode: restart
+    parameters:
+      payload: string
+      is_text: bool
+    then:
+      - if:
+          condition:
+            lambda: 'return payload.empty();'
+          then:
+            - text_sensor.template.publish:
+                id: nfc_last_result
+                state: "Write refused: nothing to write"
+            - event.trigger:
+                id: nfc_event
+                event_type: write_failed
+            - script.execute: feedback_fail
+            # Re-show whatever is really armed (the select already switched to Write optimistically)
+            - script.execute:
+                id: set_mode_display
+                option: !lambda 'return id(nfc_task_kind) == 1 ? std::string("Write") : (id(nfc_task_kind) == 2 ? std::string("Clean") : (id(nfc_task_kind) == 3 ? std::string("Format") : std::string("Read")));'
+          else:
+            - lambda: |-
+                id(nfc_expected) = payload;
+                if (is_text) {
+                  auto msg = std::make_shared<nfc::NdefMessage>();
+                  msg->add_text_record(payload);
+                  id(nfcc).set_tag_write_message(msg);
+                } else {
+                  // AAR only on HA tag URIs; on other URLs it hijacks Android's handler
+                  bool aar = id(ha_app_record).state && payload.rfind(nfc::HA_TAG_ID_PREFIX, 0) == 0;
+                  // Plain string/bool binds to both the 2026.9 (optional) and 2026.10 overloads
+                  id(nfcc).set_tag_write_message(payload, aar);
+                }
+            - script.execute:
+                id: nfc_task
+                task: 1
+
+  # ---------- Cancel any pending task and return to read mode ----------
+  - id: nfc_cancel
+    then:
+      - if:
+          condition:
+            script.is_running: nfc_task
+          then:
+            - script.stop: nfc_task
+      # Unconditional so a chip-armed / script-idle mismatch can always be repaired
+      - tag.set_read_mode: nfcc
+      - if:
+          condition:
+            lambda: 'return id(nfc_task_kind) != 0;'
+          then:
+            - lambda: 'id(nfc_task_kind) = 0;'
+            - text_sensor.template.publish:
+                id: nfc_last_result
+                state: "Cancelled"
+            - event.trigger:
+                id: nfc_event
+                event_type: cancelled
+            - script.execute:
+                id: buzzer_play
+                song: "cancel:d=16,o=5,b=200:g,e"
+      # A pending verification becomes "unverified (cancelled)", not silently dropped
+      - if:
+          condition:
+            lambda: 'return id(nfc_post_mode) == 1 || id(nfc_post_mode) == 2;'
+          then:
+            - text_sensor.template.publish:
+                id: nfc_last_result
+                state: !lambda 'return id(nfc_task_kind_done) == 1 ? std::string("Write unverified (cancelled)") : (id(nfc_task_kind_done) == 2 ? std::string("Clean unverified (cancelled)") : std::string("Format unverified (cancelled)"));'
+            - event.trigger:
+                id: nfc_event
+                event_type: unverified
+      - lambda: |-
+          id(nfc_task_kind) = 0;
+          id(nfc_post_mode) = 0;
+          id(nfc_post_until) = 0;
+      - script.execute: led_idle
+      - script.execute:
+          id: set_mode_display
+          option: "Read"
+
+  # ---------- Publish the Mode select without re-triggering on_value ----------
+  - id: set_mode_display
+    parameters:
+      option: string
+    then:
+      - lambda: |-
+          id(mode_select_guard) = true;
+          id(nfc_mode).publish_state(option);
+          id(mode_select_guard) = false;
+
+  # ---------- Card emulation ----------
+  - id: apply_emulation
+    then:
+      - if:
+          condition:
+            lambda: 'return id(emulation_url).state.empty();'
+          then:
+            # Keep the chip and the switch honest: nothing to emulate
+            - tag.emulation_off: nfcc
+            - lambda: 'id(nfcc).set_tag_ttl(1000);'
+            - text_sensor.template.publish:
+                id: nfc_last_result
+                state: "Emulation off: Emulation URL is empty"
+          else:
+            - lambda: |-
+                std::string url = id(emulation_url).state;
+                bool aar = id(ha_app_record).state && url.rfind(nfc::HA_TAG_ID_PREFIX, 0) == 0;
+                id(nfcc).set_tag_emulation_message(url, aar);
+                // RW+CE discovery cycles every 760ms; keep tags cached across cycles
+                id(nfcc).set_tag_ttl(2000);
+            - tag.emulation_on: nfcc
+
+  # ---------- Feedback primitives ----------
+  - id: buzzer_play
+    mode: restart
+    parameters:
+      song: string
+    then:
+      - if:
+          condition:
+            switch.is_on: buzzer_enabled
+          then:
+            # play() is a no-op while a song is still playing (rtttl.cpp:266-272)
+            - rtttl.stop:
+            - rtttl.play:
+                rtttl: !lambda 'return song;'
+
+  - id: feedback_fail
+    then:
+      - script.execute:
+          id: led_flash
+          r: 255
+          g: 0
+          b: 0
+          count: 3
+          on_ms: 150
+          off_ms: 150
+      - script.execute:
+          id: buzzer_play
+          song: "fail:d=8,o=5,b=180:e,c"
+
+  - id: led_flash
+    mode: restart
+    parameters:
+      r: int
+      g: int
+      b: int
+      count: int
+      on_ms: int
+      off_ms: int
+    then:
+      # When LED feedback is disabled the light is never touched (it stays a normal HA light)
+      - if:
+          condition:
+            switch.is_on: led_feedback_enabled
+          then:
+            - repeat:
+                count: !lambda 'return count;'
+                then:
+                  - light.turn_on:
+                      id: rgb_light
+                      brightness: !lambda 'return id(led_brightness).state / 100.0f;'
+                      red: !lambda 'return r / 255.0f;'
+                      green: !lambda 'return g / 255.0f;'
+                      blue: !lambda 'return b / 255.0f;'
+                      effect: none
+                  - delay: !lambda 'return (uint32_t) on_ms;'
+                  - light.turn_off: rgb_light
+                  - delay: !lambda 'return (uint32_t) off_ms;'
+            - script.execute: led_idle
+
+  # Steady state: pulse in the task colour while armed, otherwise off
+  - id: led_idle
+    then:
+      - if:
+          condition:
+            switch.is_on: led_feedback_enabled
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(nfc_task_kind) != 0;'
+                then:
+                  - light.turn_on:
+                      id: rgb_light
+                      brightness: !lambda 'return id(led_brightness).state / 100.0f;'
+                      red: !lambda 'return id(nfc_task_kind) == 1 ? 0.0f : 1.0f;'
+                      green: !lambda 'return id(nfc_task_kind) == 1 ? 0.3f : (id(nfc_task_kind) == 2 ? 0.6f : 0.0f);'
+                      blue: !lambda 'return id(nfc_task_kind) == 1 ? 1.0f : (id(nfc_task_kind) == 2 ? 0.0f : 1.0f);'
+                      effect: "Armed Pulse"
+                else:
+                  # Not armed: keep the first-boot indicator if still pending
+                  - if:
+                      condition:
+                        lambda: 'return id(runTest);'
+                      then:
+                        - script.execute: first_boot_indicator
+                      else:
+                        - light.turn_off: rgb_light
+
+  # ---------- First boot / factory test ----------
+  # Acknowledges the first-boot indicator; no-op once clear
+  - id: dismiss_first_boot
+    then:
+      - if:
+          condition:
+            lambda: 'return id(runTest);'
+          then:
+            - lambda: 'id(runTest) = false;'
+            - light.turn_off: rgb_light
+
+  # First-boot indicator: green when the PN7160 came up, red otherwise.
+  # Stays lit until the first tag read (dismiss_first_boot) proves NFC end to end.
+  - id: testScript
+    then:
+      # Let the NCI init retries settle before judging is_failed()
+      - delay: 3s
+      - script.execute: first_boot_indicator
+
+  # The indicator itself, without the settle delay, so other scripts can re-show it
+  - id: first_boot_indicator
+    then:
+      - if:
+          condition:
+            lambda: 'return id(runTest) && !id(nfcc).is_failed();'
+          then:
+            - light.turn_on:
+                id: rgb_light
+                brightness: 30%
+                red: 0%
+                green: 100%
+                blue: 0%
+      - if:
+          condition:
+            lambda: 'return id(runTest) && id(nfcc).is_failed();'
+          then:
+            - light.turn_on:
+                id: rgb_light
+                brightness: 30%
+                red: 100%
+                green: 0%
+                blue: 0%
