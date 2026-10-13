@@ -1,0 +1,34 @@
+name: Build and Publish
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      bypass-yaml-check:
+        description: 'Bypass YAML change check (force build/publish)'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  build-and-publish:
+    uses: ApolloAutomation/Workflows/.github/workflows/build.yml@main
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+      pull-requests: write
+    with:
+      device-name: nfc-1
+      yaml-files: |
+        Integrations/ESPHome/NFC-1.yaml
+      firmware-names: "1:firmware"
+      core-yaml-path: Integrations/ESPHome/Core.yaml
+      esphome-version: stable
+      # Bypass check if manually triggered with bypass option
+      check-yaml-changes: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.bypass-yaml-check == 'true') }}
+      publish-to-pages: true
+      has-installer: true
+      installer-path: static

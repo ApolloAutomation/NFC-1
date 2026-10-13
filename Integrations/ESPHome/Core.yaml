@@ -79,6 +79,21 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: '0'
+  # Watchdog: millis() of the last NFC activity
+  - id: nfc_last_activity
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # Watchdog: a fast restart is pending
+  - id: nfc_wd_armed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Watchdog: millis() of the last discovery restart
+  - id: nfc_wd_last_restart
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
   - id: mode_select_guard
     type: bool
     restore_value: no
@@ -103,6 +118,8 @@ pn7160_i2c:
   on_tag:
     then:
       - lambda: |-
+          id(nfc_last_activity) = millis();
+          id(nfc_wd_armed) = true;
           // Phones in HCE mode can show up as a random-UID (08-xx-xx-xx) NFC-A target
           bool random_uid = !tag.has_ndef_message() && x.size() == 11 && x.rfind("08-", 0) == 0;
           id(nfc_random_uid) = random_uid;
@@ -262,6 +279,9 @@ pn7160_i2c:
                   - homeassistant.tag_scanned: !lambda 'return id(nfc_report_id);'
   on_tag_removed:
     then:
+      - lambda: |-
+          id(nfc_last_activity) = millis();
+          id(nfc_wd_armed) = true;
       # A tag consumed by a write/clean/format never reported present
       - if:
           condition:
@@ -283,6 +303,9 @@ pn7160_i2c:
       - lambda: 'id(nfc_write_finished) = true;'
   on_emulated_tag_scan:
     then:
+      - lambda: |-
+          id(nfc_last_activity) = millis();
+          id(nfc_wd_armed) = true;
       # A phone may read the emulated NDEF file several times per tap
       - if:
           condition:
@@ -677,6 +700,34 @@ light:
             float s = t < 1000 ? t / 1000.0f : (2000 - t) / 1000.0f;
             it[0] = current_color * (uint8_t) (255 * (0.15f + 0.85f * s));
 
+# The pn71xx driver has no liveness check while polling, so a silent PN7160
+# can stop reporting tags until reboot. Restarting discovery is cheap and
+# only toggles polling; it never rewrites NFCC configuration.
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              uint32_t now = millis();
+              if (!id(nfcc).polling_enabled()) return false;
+              if (id(nfcc).is_writing()) return false;
+              if (id(nfc_task_kind) != 0) return false;
+              if (id(tag_present).state) return false;
+              bool fast = id(nfc_wd_armed) && (now - id(nfc_last_activity) >= 5000);
+              bool slow = (now - id(nfc_last_activity) >= 300000) &&
+                          (now - id(nfc_wd_last_restart) >= 300000);
+              return fast || slow;
+          then:
+            - lambda: |-
+                uint32_t now = millis();
+                bool fast = id(nfc_wd_armed) && (now - id(nfc_last_activity) >= 5000);
+                id(nfc_wd_armed) = false;
+                id(nfc_wd_last_restart) = now;
+                ESP_LOGD("nfc_watchdog", "Restarting tag discovery (%s)", fast ? "after activity" : "periodic");
+            - tag.polling_off: nfcc
+            - tag.polling_on: nfcc
+
 script:
   # ---------- NFC task runner: 1 = write, 2 = clean, 3 = format ----------
   - id: nfc_task
@@ -793,6 +844,9 @@ script:
                         - script.execute:
                             id: buzzer_play
                             song: "ok:d=16,o=6,b=200:c,e,g"
+            - lambda: |-
+                id(nfc_last_activity) = millis();
+                id(nfc_wd_armed) = true;
           else:
             # write_mode() refuses when no message is set (pn7160.cpp:126-130)
             - lambda: 'id(nfc_task_kind) = 0;'
