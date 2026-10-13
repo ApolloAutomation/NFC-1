@@ -1,0 +1,16 @@
+name: Weekly Firmware Build
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Weekly Build
+    uses: ApolloAutomation/Workflows/.github/workflows/esphome-ci.yml@main
+    with:
+      yaml-files: |
+        Integrations/ESPHome/NFC-1.yaml

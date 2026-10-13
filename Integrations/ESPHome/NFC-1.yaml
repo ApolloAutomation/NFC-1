@@ -1,0 +1,394 @@
+substitutions:
+  # Manifest bases: stable=Pages, beta=release assets
+  stable_manifest_base: "https://apolloautomation.github.io/NFC-1"
+  beta_manifest_base: "https://github.com/ApolloAutomation/NFC-1/releases/download/beta-fw"
+  ota_stable_manifest: "${stable_manifest_base}/firmware/manifest.json"
+  ota_beta_manifest: "${beta_manifest_base}/manifest-standard.json"
+
+esphome:
+  name: "apollo-nfc-1"
+  friendly_name: Apollo NFC-1
+  comment: Apollo NFC-1
+  name_add_mac_suffix: true
+
+  project:
+    name: "ApolloAutomation.NFC-1"
+    version: "${version}"
+
+  # channel_colors needs 2026.8; esp32.flash_mode needs 2026.6
+  min_version: 2026.8.0
+  on_boot:
+    - priority: 500
+      then:
+        - text_sensor.template.publish:
+            id: apollo_firmware_version
+            state: "${version}"
+    # Point update entity at selected manifest
+    - priority: -100
+      then:
+        - script.execute: apply_ota_source
+    # Boot status colours; waits for Wi-Fi/HA so blue can win; skipped on first boot so the test indicator stays visible
+    - priority: -100
+      then:
+        - wait_until:
+            condition: wifi.connected
+            timeout: 20s
+        - if:
+            condition: wifi.connected
+            then:
+              - wait_until:
+                  condition: api.connected
+                  timeout: 15s
+              # status binary_sensor (ink_ha_connected) polls every 1s
+              - delay: 1500ms
+        - if:
+            condition:
+              lambda: 'return !id(runTest);'
+            then:
+              - script.execute: statusCheck
+    - priority: -10
+      then:
+        - if:
+            condition:
+              - lambda: "return id(runTest);"
+            then:
+              - script.execute: testScript
+    # Re-apply Bluetooth Proxy switch after setup
+    - priority: -300
+      then:
+        - if:
+            condition:
+              switch.is_on: bluetooth_proxy_switch
+            then:
+              - esp32_ble_tracker.start_scan:
+                  continuous: true
+            else:
+              - esp32_ble_tracker.stop_scan:
+
+dashboard_import:
+  package_import_url: github://ApolloAutomation/NFC-1/Integrations/ESPHome/NFC-1.yaml
+  import_full_config: false
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+  - platform: http_request
+    id: ota_managed
+
+esp32_ble_tracker:
+  id: ble_tracker
+  # continuous FALSE on purpose; the switch owns scanning
+  scan_parameters:
+    continuous: false
+
+bluetooth_proxy:
+  id: ble_proxy
+
+# Improv over BLE; required for the M4E badge
+esp32_improv:
+  id: ble_improv
+  # 'none' = no physical authorization step
+  authorizer: none
+  status_indicator: improv_status_led
+
+http_request:
+  id: http_request_client
+  verify_ssl: true
+  # Fits GitHub's ~3.6KB CSP redirect header
+  buffer_size_rx: 5120
+  # Fits GitHub's long signed redirect URL
+  buffer_size_tx: 2048
+
+safe_mode:
+  id: safe_mode_component
+
+update:
+  - platform: http_request
+    id: update_http_request
+    name: Firmware Update
+    # This one really is firmware
+    device_class: firmware
+    source: ${ota_stable_manifest}
+
+wifi:
+  ap:
+    ssid: "Apollo NFC1 Hotspot"
+
+logger:
+  id: logger_component
+
+improv_serial:
+  id: serial_improv
+
+captive_portal:
+  id: captive_portal_component
+
+web_server:
+  id: web_server_component
+  port: 80
+  version: 3
+  # /update only while the captive portal (fallback AP) is active
+  ota: false
+  # No unauthenticated log stream; it leaks tag UIDs at INFO
+  log: false
+
+# Improv provisioning indicator; must be a BinaryOutput
+output:
+  - platform: template
+    type: binary
+    id: improv_status_led
+    write_action:
+      - if:
+          condition:
+            lambda: "return state;"
+          then:
+            - light.turn_on:
+                id: rgb_light
+                brightness: 60%
+                red: 0%
+                green: 40%
+                blue: 100%
+          else:
+            # Provisioning done: restore the first-boot indicator unless testScript still owns the LED
+            - if:
+                condition:
+                  lambda: 'return id(runTest) && !id(testScript).is_running();'
+                then:
+                  - script.execute: first_boot_indicator
+                else:
+                  - light.turn_off: rgb_light
+
+api:
+  id: api_server
+  # 0ms: never batch states, otherwise the NFC event beats the Last Tag states to HA
+  batch_delay: 0ms
+  # No key on purpose; M4E forbids baked secrets
+  encryption:
+  # 'actions' is the current spelling for 'services'
+  actions:
+    - action: play_buzzer
+      variables:
+        song_str: string
+      then:
+        # play() is a no-op while a song is still playing
+        - rtttl.stop:
+        - rtttl.play:
+            rtttl: !lambda 'return song_str;'
+    - action: write_url
+      variables:
+        url: string
+      then:
+        - script.execute:
+            id: nfc_write
+            payload: !lambda 'return url;'
+            is_text: false
+    - action: write_text
+      variables:
+        text_str: string
+      then:
+        - script.execute:
+            id: nfc_write
+            payload: !lambda 'return text_str;'
+            is_text: true
+    - action: write_ha_tag
+      variables:
+        tag_id: string
+      then:
+        - script.execute:
+            id: nfc_write
+            payload: !lambda |-
+              std::string s = tag_id;
+              size_t a = s.find_first_not_of(" \t\r\n");
+              size_t b = s.find_last_not_of(" \t\r\n");
+              s = (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
+              if (s.empty()) return nfc::get_random_ha_tag_ndef();
+              if (s.rfind(nfc::HA_TAG_ID_PREFIX, 0) == 0) return s;
+              return std::string(nfc::HA_TAG_ID_PREFIX) + s;
+            is_text: false
+    - action: clean_tag
+      then:
+        - script.execute:
+            id: nfc_task
+            task: 2
+    - action: format_tag
+      then:
+        - script.execute:
+            id: nfc_task
+            task: 3
+    - action: cancel_tag_operation
+      then:
+        - script.execute: nfc_cancel
+    - action: set_emulation_url
+      variables:
+        url: string
+      then:
+        - text.set:
+            id: emulation_url
+            value: !lambda 'return url;'
+  # Never reboot for lack of an HA client; local NFC keeps working offline
+  reboot_timeout: 0s
+
+select:
+  - platform: template
+    name: "Firmware Channel"
+    id: firmware_channel
+    icon: mdi:source-branch
+    entity_category: "config"
+    optimistic: true
+    restore_value: true
+    options:
+      - "Stable"
+      - "Beta"
+    initial_option: "Stable"
+    on_value:
+      then:
+        - script.execute: apply_ota_source
+
+button:
+  # Renamed: the update: entity already uses that name
+  - platform: template
+    name: "Reinstall Firmware"
+    id: update_firmware
+    icon: mdi:cloud-download
+    entity_category: "config"
+    on_press:
+      - logger.log: "Applying firmware update for the selected channel"
+      - delay: 3s
+      - script.execute: apply_ota_source
+      - script.wait: apply_ota_source
+      # Give async manifest fetch time to land
+      - delay: 5s
+      - lambda: id(update_http_request).perform(true);
+
+  # Recovery entities; support asks for these first
+  - platform: restart
+    name: "Restart"
+    id: restart_button
+    entity_category: "diagnostic"
+
+  # Skips all component setup for 5 minutes, so it must stay off a dashboard
+  - platform: safe_mode
+    name: "Restart (Safe Mode)"
+    id: safe_mode_button
+    entity_category: "diagnostic"
+    disabled_by_default: true
+
+switch:
+  - platform: template
+    name: "Bluetooth Proxy"
+    id: bluetooth_proxy_switch
+    icon: mdi:bluetooth
+    entity_category: "config"
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    on_turn_on:
+      - esp32_ble_tracker.start_scan:
+          continuous: true
+    on_turn_off:
+      - esp32_ble_tracker.stop_scan:
+
+binary_sensor:
+  - platform: status
+    name: Online
+    id: ink_ha_connected
+
+sensor:
+  - platform: wifi_signal
+    name: RSSI
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+# Wi-Fi diagnostics, disabled by default
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      id: wifi_ip_address
+      entity_category: "diagnostic"
+      disabled_by_default: true
+    ssid:
+      name: "Connected SSID"
+      id: wifi_ssid
+      entity_category: "diagnostic"
+      disabled_by_default: true
+    bssid:
+      name: "Connected BSSID"
+      id: wifi_bssid
+      entity_category: "diagnostic"
+      disabled_by_default: true
+    mac_address:
+      name: "MAC Address"
+      id: wifi_mac_address
+      entity_category: "diagnostic"
+      disabled_by_default: true
+
+  - platform: version
+    name: "ESPHome Version"
+    id: esphome_version
+    hide_timestamp: true
+    entity_category: "diagnostic"
+  - platform: template
+    name: "Apollo Firmware Version"
+    id: apollo_firmware_version
+    update_interval: never
+    entity_category: "diagnostic"
+
+script:
+  - id: apply_ota_source
+    # Set OTA manifest from the channel select
+    then:
+      - lambda: |-
+          const bool beta = id(firmware_channel).current_option() == "Beta";
+          // Literals only: since 2026.10 set_source_url keeps the raw pointer
+          const char *url = beta ? "${ota_beta_manifest}" : "${ota_stable_manifest}";
+          ESP_LOGI("firmware", "OTA manifest set to: %s", url);
+          id(update_http_request).set_source_url(url);
+      - component.update: update_http_request
+
+  # Boot status: blue = HA, green = Wi-Fi only, yellow = no Wi-Fi; off after 5s
+  - id: statusCheck
+    then:
+      - if:
+          condition:
+            - lambda: 'return id(ink_ha_connected).state;'
+          then:
+            - logger.log: "Apollo Automation: Connected To HA"
+            - light.turn_on:
+                id: rgb_light
+                brightness: 60%
+                red: 0%
+                green: 0%
+                blue: 100%
+          else:
+            - if:
+                condition:
+                  - wifi.connected
+                then:
+                  - logger.log: "Apollo Automation: Connected To Wifi"
+                  - light.turn_on:
+                      id: rgb_light
+                      brightness: 60%
+                      red: 0%
+                      green: 100%
+                      blue: 0%
+                else:
+                  - logger.log: "Apollo Automation: Not Connected To Wifi"
+                  - light.turn_on:
+                      id: rgb_light
+                      brightness: 60%
+                      red: 100%
+                      green: 100%
+                      blue: 0%
+      - delay: 5s
+      # Hand the LED back to an armed-mode pulse instead of always killing it
+      - if:
+          condition:
+            lambda: 'return id(nfc_task_kind) != 0 && id(led_feedback_enabled).state;'
+          then:
+            - script.execute: led_idle
+          else:
+            - light.turn_off: rgb_light
+
+packages:
+  core: !include Core.yaml
