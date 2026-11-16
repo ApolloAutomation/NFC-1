@@ -15,8 +15,8 @@ esphome:
     name: "ApolloAutomation.NFC-1"
     version: "${version}"
 
-  # channel_colors needs 2026.8; esp32.flash_mode needs 2026.6
-  min_version: 2026.8.0
+  # improv_ble needs 2026.10; channel_colors needs 2026.8
+  min_version: 2026.10.0
   on_boot:
     - priority: 500
       then:
@@ -85,7 +85,7 @@ bluetooth_proxy:
   id: ble_proxy
 
 # Improv over BLE; required for the M4E badge
-esp32_improv:
+improv_ble:
   id: ble_improv
   # 'none' = no physical authorization step
   authorizer: none
@@ -111,6 +111,10 @@ update:
     source: ${ota_stable_manifest}
 
 wifi:
+  on_connect:
+    - component.update: update_http_request
+  # Keeps today's no-reboot on lost Wi-Fi; 2026.11 drops the AP exemption
+  reboot_timeout: 0s
   ap:
     ssid: "Apollo NFC1 Hotspot"
 
