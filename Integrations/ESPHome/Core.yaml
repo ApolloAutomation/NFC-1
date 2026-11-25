@@ -1,5 +1,5 @@
 substitutions:
-  version: "26.11.15.1"
+  version: "26.11.25.1"
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -32,6 +32,16 @@ globals:
     restore_value: yes
     type: bool
     initial_value: "true"
+  # Wi-Fi setup blink was shown this boot
+  - id: improv_blinked
+    restore_value: no
+    type: bool
+    initial_value: "false"
+  # True while the solid flash result owns the LED
+  - id: first_boot_hold
+    restore_value: no
+    type: bool
+    initial_value: "false"
   # 0 = read/idle, 1 = write, 2 = clean, 3 = format
   - id: nfc_task_kind
     type: int
@@ -1144,9 +1154,18 @@ script:
   # Stays lit until the first tag read (dismiss_first_boot) proves NFC end to end.
   - id: testScript
     then:
+      - lambda: 'id(first_boot_hold) = true;'
       # Let the NCI init retries settle before judging is_failed()
       - delay: 3s
       - script.execute: first_boot_indicator
+      # Solid result for 5 s, then Wi-Fi setup blink
+      - delay: 5s
+      - lambda: 'id(first_boot_hold) = false;'
+      - if:
+          condition:
+            lambda: 'return id(ble_improv).is_active() && !wifi::global_wifi_component->is_connected() && !id(nfcc).is_failed();'
+          then:
+            - light.turn_off: rgb_light
 
   # The indicator itself, without the settle delay, so other scripts can re-show it
   - id: first_boot_indicator

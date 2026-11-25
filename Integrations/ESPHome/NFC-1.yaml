@@ -113,6 +113,13 @@ update:
 wifi:
   on_connect:
     - component.update: update_http_request
+    # Blink is over: re-show the first-boot result
+    - if:
+        condition:
+          lambda: 'return id(improv_blinked) && id(runTest) && !id(first_boot_hold) && id(nfc_task_kind) == 0;'
+        then:
+          - lambda: 'id(improv_blinked) = false;'
+          - script.execute: first_boot_indicator
   # Keeps today's no-reboot on lost Wi-Fi; 2026.11 drops the AP exemption
   reboot_timeout: 0s
   ap:
@@ -142,25 +149,44 @@ output:
     type: binary
     id: improv_status_led
     write_action:
+      # Solid flash result owns the LED first
       - if:
           condition:
-            lambda: "return state;"
+            lambda: "return !id(first_boot_hold);"
           then:
-            - light.turn_on:
-                id: rgb_light
-                brightness: 100%
-                red: 0%
-                green: 40%
-                blue: 100%
-          else:
-            # Provisioning done: restore the first-boot indicator unless testScript still owns the LED
             - if:
                 condition:
-                  lambda: 'return id(runTest) && !id(testScript).is_running();'
+                  lambda: "return state;"
                 then:
-                  - script.execute: first_boot_indicator
+                  - lambda: 'id(improv_blinked) = true;'
+                  - light.turn_on:
+                      id: rgb_light
+                      brightness: 100%
+                      red: 0%
+                      green: 40%
+                      blue: 100%
                 else:
-                  - light.turn_off: rgb_light
+                  - if:
+                      condition:
+                        # Blink off-half: red only on NFC fault
+                        lambda: 'return id(ble_improv).is_active() && !wifi::global_wifi_component->is_connected();'
+                      then:
+                        - if:
+                            condition:
+                              lambda: 'return id(runTest) && id(nfcc).is_failed();'
+                            then:
+                              - script.execute: first_boot_indicator
+                            else:
+                              - light.turn_off: rgb_light
+                      # Provisioning done: restore the first-boot indicator
+                      else:
+                        - if:
+                            condition:
+                              lambda: 'return id(runTest);'
+                            then:
+                              - script.execute: first_boot_indicator
+                            else:
+                              - light.turn_off: rgb_light
 
 api:
   id: api_server
