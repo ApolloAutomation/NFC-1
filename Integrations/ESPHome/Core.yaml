@@ -1,5 +1,5 @@
 substitutions:
-  version: "26.11.25.2"
+  version: "26.11.25.3"
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -599,7 +599,7 @@ text:
             - script.execute: apply_emulation
 
 binary_sensor:
-  # Boot button: tap = status + self-test, 10s hold = factory reset (mains: 3s hold does nothing)
+  # Tap: status + self-test; 3-10s: nothing; 10s+: factory reset
   - platform: gpio
     pin:
       number: GPIO9
