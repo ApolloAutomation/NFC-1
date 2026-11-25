@@ -1,5 +1,5 @@
 substitutions:
-  version: "26.10.13.2"
+  version: "26.11.25.3"
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -22,11 +22,26 @@ rtttl:
   output: buzzer
 
 globals:
+  # millis() when the boot button went down; on_release measures the hold
+  - id: button_press_timestamp
+    restore_value: no
+    type: uint32_t
+    initial_value: "0"
   # First boot, not yet acknowledged by a tag read
   - id: runTest
     restore_value: yes
     type: bool
     initial_value: "true"
+  # Wi-Fi setup blink was shown this boot
+  - id: improv_blinked
+    restore_value: no
+    type: bool
+    initial_value: "false"
+  # True while the solid flash result owns the LED
+  - id: first_boot_hold
+    restore_value: no
+    type: bool
+    initial_value: "false"
   # 0 = read/idle, 1 = write, 2 = clean, 3 = format
   - id: nfc_task_kind
     type: int
@@ -489,7 +504,7 @@ number:
     min_value: 1
     max_value: 100
     step: 1
-    initial_value: 80
+    initial_value: 100
     unit_of_measurement: "%"
 
   - platform: template
@@ -584,6 +599,37 @@ text:
             - script.execute: apply_emulation
 
 binary_sensor:
+  # Tap: status + self-test; 3-10s: nothing; 10s+: factory reset
+  - platform: gpio
+    pin:
+      number: GPIO9
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+      ignore_strapping_warning: true
+    id: reset_button
+    on_press:
+      then:
+        - lambda: |-
+            id(button_press_timestamp) = millis();
+    on_release:
+      then:
+        - if:
+            condition:
+              lambda: 'return millis() - id(button_press_timestamp) >= 10000;'
+            then:
+              - switch.turn_on: factory_reset_switch
+            else:
+              - if:
+                  condition:
+                    lambda: 'return millis() - id(button_press_timestamp) < 3000;'
+                  then:
+                    - script.execute: statusCheck
+                    - delay: 3s
+                    - lambda: 'id(runTest) = true;'
+                    - script.execute: testScript
+
   - platform: template
     name: "Tag Present"
     id: tag_present
@@ -677,7 +723,7 @@ light:
     num_leds: 1
     channel_colors: GRB
     rmt_symbols: 48
-    color_correct: [40%, 40%, 40%]
+    # No color_correct cap: a single status LED needs full output
     effects:
       - pulse:
           name: "Slow Pulse"
@@ -1108,9 +1154,18 @@ script:
   # Stays lit until the first tag read (dismiss_first_boot) proves NFC end to end.
   - id: testScript
     then:
+      - lambda: 'id(first_boot_hold) = true;'
       # Let the NCI init retries settle before judging is_failed()
       - delay: 3s
       - script.execute: first_boot_indicator
+      # Solid result for 5 s, then Wi-Fi setup blink
+      - delay: 5s
+      - lambda: 'id(first_boot_hold) = false;'
+      - if:
+          condition:
+            lambda: 'return id(ble_improv).is_active() && !wifi::global_wifi_component->is_connected() && !id(nfcc).is_failed();'
+          then:
+            - light.turn_off: rgb_light
 
   # The indicator itself, without the settle delay, so other scripts can re-show it
   - id: first_boot_indicator
@@ -1121,7 +1176,7 @@ script:
           then:
             - light.turn_on:
                 id: rgb_light
-                brightness: 30%
+                brightness: 100%
                 red: 0%
                 green: 100%
                 blue: 0%
@@ -1131,7 +1186,7 @@ script:
           then:
             - light.turn_on:
                 id: rgb_light
-                brightness: 30%
+                brightness: 100%
                 red: 100%
                 green: 0%
                 blue: 0%
