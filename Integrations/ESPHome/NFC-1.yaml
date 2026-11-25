@@ -15,7 +15,7 @@ esphome:
     name: "ApolloAutomation.NFC-1"
     version: "${version}"
 
-  # improv_ble needs 2026.10; channel_colors needs 2026.8
+  # get_source_url needs 2026.10.1; improv_ble 2026.10
   min_version: 2026.10.1
   on_boot:
     - priority: 500
@@ -366,14 +366,12 @@ script:
     then:
       - lambda: |-
           const bool beta = id(firmware_channel).current_option() == "Beta";
-          // Literals only: since 2026.10 set_source_url keeps the raw pointer
           const char *url = beta ? "${ota_beta_manifest}" : "${ota_stable_manifest}";
           ESP_LOGI("firmware", "OTA manifest set to: %s", url);
           id(update_http_request).set_source_url(url);
       - component.update: update_http_request
 
-  # The update component drops a check requested while another one is running,
-  # so keep asking until install_selected_channel has what it needs.
+  # Retry: update drops checks requested mid-check
   - id: request_channel_manifest
     mode: restart
     then:
@@ -384,19 +382,16 @@ script:
             - script.wait: apply_ota_source
             - delay: 5s
 
-  # Forced install, but only of a manifest fetched after this press from the
-  # selected channel. mode single: a second press while this runs is ignored.
+  # Install only a fresh selected-channel manifest
   - id: install_selected_channel
     mode: single
     then:
-      # Mark the cached firmware URL as old. Only a successful check replaces it.
+      # Mark cached URL stale; HA Install meanwhile fails harmlessly
       - lambda: |-
           std::string &fw = const_cast<std::string &>(id(update_http_request).update_info.firmware_url);
           if (fw.rfind('!', 0) != 0) fw.insert(0, "!");
       - script.execute: request_channel_manifest
-      # Wait for a check without error whose firmware sits in the directory of
-      # the selected channel's manifest (relative Pages paths are merged with
-      # it, beta paths are release-asset URLs in the same directory).
+      # Wait for firmware in selected channel's directory
       - wait_until:
           timeout: 20s
           condition:

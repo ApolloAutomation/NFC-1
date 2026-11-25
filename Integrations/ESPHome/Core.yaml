@@ -599,7 +599,7 @@ text:
             - script.execute: apply_emulation
 
 binary_sensor:
-  # Boot button: tap = status + self-test, 10s hold = factory reset (mains: 3s hold does nothing)
+  # Tap: status + self-test; 3-10s: nothing; 10s+: factory reset
   - platform: gpio
     pin:
       number: GPIO9
