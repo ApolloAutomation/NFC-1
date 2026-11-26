@@ -111,6 +111,7 @@ update:
     source: ${ota_stable_manifest}
 
 wifi:
+  id: wifi_1
   on_connect:
     - component.update: update_http_request
     # Blink is over: re-show the first-boot result
